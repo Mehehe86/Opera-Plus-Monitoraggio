@@ -1,0 +1,73 @@
+name: Censimento HTML completo
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: censimento-html-completo
+  cancel-in-progress: false
+jobs:
+  piano:
+    runs-on: ubuntu-latest
+    outputs:
+      lotti: ${{ steps.piano.outputs.lotti }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test automatici
+        run: python -m unittest discover -s scripts -p 'test_censimento_html.py'
+      - name: Calcola lotti
+        id: piano
+        run: echo "lotti=$(python scripts/censimento_html_lotti.py --plan)" >> "$GITHUB_OUTPUT"
+  censimento:
+    needs: piano
+    if: needs.piano.outputs.lotti != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        lotto: ${{ fromJSON(needs.piano.outputs.lotti) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Esamina lotto
+        run: python scripts/censimento_html_lotti.py --batch ${{ matrix.lotto }}
+      - name: Salva risultati anche in caso di errore
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: html-lotto-${{ matrix.lotto }}
+          path: rapporti/html_lotti/lotto-*.json
+          if-no-files-found: warn
+          retention-days: 14
+  riepilogo:
+    needs: [piano, censimento]
+    if: always() && needs.piano.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        if: needs.piano.outputs.lotti != '[]'
+        with:
+          pattern: html-lotto-*
+          path: rapporti/html_lotti
+          merge-multiple: true
+      - name: Riepilogo e controllo completezza
+        run: python scripts/censimento_html_lotti.py --merge
+      - name: Salva rapporto complessivo
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: censimento-html-completo
+          path: rapporti/html_lotti/riepilogo.json
+          if-no-files-found: warn
+          retention-days: 14
