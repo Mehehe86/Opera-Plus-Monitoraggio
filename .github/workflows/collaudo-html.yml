@@ -17,6 +17,8 @@ jobs:
           python-version: '3.12'
       - name: Controllo sintattico
         run: python -m py_compile scripts/censimento_rss.py scripts/censimento_html.py
+      - name: Test automatici di regressione
+        run: python -m unittest discover -s scripts -p 'test_censimento_html.py'
       - name: Collaudo Torino e Parigi
         run: python scripts/censimento_html.py --source "Teatro Regio Torino" --source "Opéra national de Paris" --max-articles 15
       - name: Salva rapporto
