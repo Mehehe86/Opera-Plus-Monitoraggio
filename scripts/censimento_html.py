@@ -150,7 +150,13 @@ class Page(HTMLParser):
 
 def parse(data):
     p = Page()
-    p.feed(data.decode("utf-8", errors="replace"))
+    match = re.search(br'charset\s*=\s*["\']?\s*([a-zA-Z0-9_-]+)', data[:8192], re.I)
+    encoding = match.group(1).decode("ascii") if match else "utf-8-sig"
+    try:
+        decoded = data.decode(encoding, errors="replace")
+    except (LookupError, UnicodeError):
+        decoded = data.decode("utf-8", errors="replace")
+    p.feed(decoded)
     return p
 
 def nodes(value):
@@ -247,6 +253,63 @@ def listing_articles(page, base, source):
                     pending = None
     return list(found.values())
 
+def structured_listing(page, base):
+    """Use explicitly typed articles with publication dates and their own URLs."""
+    found = {}
+    def walk(obj):
+        if isinstance(obj, list):
+            for child in obj:
+                yield from walk(child)
+        elif isinstance(obj, dict):
+            yield obj
+            for child in obj.values():
+                if isinstance(child, (dict, list)):
+                    yield from walk(child)
+    for item in walk(page.jsonld):
+        types = item.get("@type", [])
+        if isinstance(types, str):
+            types = [types]
+        if not isinstance(types, list) or not any(str(t).rsplit("/", 1)[-1].lower() in ARTICLE_TYPES for t in types):
+            continue
+        raw_url = item.get("url") or item.get("mainEntityOfPage") or item.get("@id")
+        if isinstance(raw_url, dict):
+            raw_url = raw_url.get("@id") or raw_url.get("url")
+        raw_title = item.get("headline") or item.get("name")
+        raw_date = item.get("datePublished")
+        if not all(isinstance(v, str) and v.strip() for v in (raw_url, raw_title, raw_date)):
+            continue
+        url = urldefrag(urljoin(base, raw_url))[0]
+        date = human_date(raw_date)
+        if date and same_site(url, base) and url.rstrip("/") != base.rstrip("/") and not SKIP.search(url):
+            found[url] = {"titolo": tidy(raw_title), "url": url, "data_pubblicazione": date,
+                          "prova": "JSON-LD Article/datePublished nella lista", "pagina_prova": base}
+    return list(found.values())
+
+SECTION_WORDS = re.compile(r"^(?:news|notizie|novit[aà]|comunicati(?:[- ]stampa)?|press(?:[- ]releases)?|actualit[eé]s|presse|nachrichten|aktuelles|noticias|prensa|nieuws|media|area[- ]stampa|latest[- ]news)$", re.I)
+
+def section_score(url, title):
+    parts = [p for p in urlsplit(url).path.strip("/").split("/") if p]
+    score = 0
+    if SECTION_WORDS.fullmatch(tidy(title)):
+        score += 5
+    if parts and SECTION_WORDS.fullmatch(parts[-1]):
+        score += 4
+    if NEWS.search(title):
+        score += 1
+    if len(parts) > 4:
+        score -= 2
+    return score
+
+def relevance_hint(row, entry):
+    # A diagnostic hint, never a reason to discard an article or assert coverage.
+    name = unicodedata.normalize("NFKD", row["fonte"].casefold())
+    title = unicodedata.normalize("NFKD", entry["titolo"].casefold())
+    name = "".join(c for c in name if not unicodedata.combining(c))
+    title = "".join(c for c in title if not unicodedata.combining(c))
+    stop = {"teatro", "theatre", "opera", "festival", "international", "competition", "concorso", "premio", "della", "delle", "national", "teatr", "awards", "musical", "music", "fondazione"}
+    terms = {w for w in re.findall(r"\w+", name) if len(w) >= 4 and w not in stop}
+    return "Nome della fonte nel titolo" if any(re.search(r"\b" + re.escape(w) + r"\b", title) for w in terms) else "Pertinenza da verificare"
+
 def blocked(page):
     title = (page.title or "").lower()
     text = " ".join(page.visible_text[:30]).lower()
@@ -274,17 +337,19 @@ def inspect(row, max_articles):
         u = urljoin(base, explicit)
         if same_site(u, base):
             sections[u] = "pagina registrata"
-    for url, title in links(home, base):
-        if NEWS.search(title) or NEWS.search(urlsplit(url).path):
+    discovered = sorted(links(home, base), key=lambda pair: section_score(*pair), reverse=True)
+    for url, title in discovered:
+        if section_score(url, title) >= 4:
             sections.setdefault(url, title)
-    for path in ("news", "notizie", "comunicati-stampa", "it/news", "it/notizie", "en/news", "fr/actualites", "actualites", "press", "presse"):
+    # Limit guessed paths; use them only after real links.
+    for path in ("news", "notizie", "actualites", "press"):
         sections.setdefault(urljoin(base, "/" + path), "tentativo")
     candidates = {}
     rule = listing_config().get(row["fonte"], {})
     if rule and explicit:
         primary = urljoin(base, explicit)
         sections = {primary: "pagina registrata", **{u: label for u, label in sections.items() if u != primary}}
-    for url, label in list(sections.items())[:12]:
+    for url, label in list(sections.items())[:8]:
         final, body, err = get_page(url)
         if err:
             result["errori"].append({"url": url, "errore": err})
@@ -300,6 +365,9 @@ def inspect(row, max_articles):
             result["articoli"].extend(listing_articles(page, final, row["fonte"]))
         if rule and label == "pagina registrata" and len(result["articoli"]) >= rule.get("minimum_expected", 1):
             break
+        for a in structured_listing(page, final):
+            if not any(x["url"] == a["url"] for x in result["articoli"]):
+                result["articoli"].append(a)
         for u, title in links(page, final):
             if u.rstrip("/") == final.rstrip("/") or len(title) < 18:
                 continue
@@ -325,6 +393,8 @@ def inspect(row, max_articles):
                 result["articoli"].append(a)
         else:
             result["candidati_non_confermati"].append({"url": final, "titolo_link": title})
+    for item in result["articoli"]:
+        item["pertinenza"] = relevance_hint(row, item)
     result["diagnostica"] = {"modello": rule.get("model", "generico"), "estrazione_riuscita": bool(result["articoli"]), "copertura_completa_verificata": False, "richiede_verifica_alternativa": not bool(result["articoli"])}
     result["stato"] = "Articoli con data confermata" if result["articoli"] else "Sezioni candidate senza articoli confermati" if result["sezioni"] else "Sezione non individuata"
     return result
