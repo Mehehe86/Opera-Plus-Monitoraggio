@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit, urldefrag
@@ -20,6 +21,36 @@ META_DATES = ("article:published_time", "datepublished", "pubdate", "parsely-pub
 
 def tidy(s):
     return " ".join((s or "").split())
+
+MONTHS = (
+    "gennaio janvier january januar enero", "febbraio fevrier february februar febrero",
+    "marzo mars march marz marzo", "aprile avril april abril",
+    "maggio mai may mayo", "giugno juin june juni junio",
+    "luglio juillet july juli julio", "agosto aout august agosto",
+    "settembre septembre september septiembre", "ottobre octobre october oktober octubre",
+    "novembre november noviembre", "dicembre decembre december dezember diciembre"
+)
+MONTH_MAP = {word: i for i, words in enumerate(MONTHS, 1) for word in words.split()}
+MONTH_PATTERN = "|".join(sorted(MONTH_MAP, key=len, reverse=True))
+
+def human_date(value):
+    value = tidy(value)
+    iso = date_iso(value)
+    if iso:
+        return iso
+    v = "".join(c for c in unicodedata.normalize("NFKD", value.lower()) if not unicodedata.combining(c))
+    m = re.fullmatch(r"(\d{1,2})(?:er|st|nd|rd|th)?[.\s]+(" + MONTH_PATTERN + r")[,\s]+(\d{4})", v)
+    if m:
+        day, month, year = m.groups()
+    else:
+        m = re.fullmatch(r"(" + MONTH_PATTERN + r")\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})", v)
+        if not m:
+            return ""
+        month, day, year = m.groups()
+    try:
+        return datetime(int(year), MONTH_MAP[month], int(day)).date().isoformat()
+    except ValueError:
+        return ""
 
 def host(url):
     return (urlsplit(url).hostname or "").lower().removeprefix("www.")
@@ -56,8 +87,18 @@ class Page(HTMLParser):
         self.headings = []
         self.title = None
         self.canonical = ""
+        self.published_times = []
+        self.time_tag = None
+        self.visible_text = []
+        self.hidden = 0
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
+        if tag in ("script", "style"):
+            self.hidden += 1
+        if tag == "time":
+            marker = " ".join((a.get(k) or "") for k in ("class", "itemprop", "aria-label")).lower()
+            if re.search(r"datepublished|published|publication|pubdate|date-publication|data-pubblicazione", marker):
+                self.time_tag = [a.get("datetime") or "", ""]
         if tag == "a" and a.get("href"):
             self.anchor = [a["href"], a.get("aria-label") or a.get("title") or ""]
         if tag == "meta":
@@ -71,6 +112,10 @@ class Page(HTMLParser):
         if tag in ("h1", "title"):
             self.heading = [tag, ""]
     def handle_data(self, data):
+        if not self.hidden:
+            self.visible_text.append(tidy(data))
+        if self.time_tag is not None:
+            self.time_tag[1] += data
         if self.anchor is not None:
             self.anchor[1] += " " + data
         if self.script is not None:
@@ -78,6 +123,11 @@ class Page(HTMLParser):
         if self.heading is not None:
             self.heading[1] += data
     def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self.hidden = max(0, self.hidden - 1)
+        if tag == "time" and self.time_tag is not None:
+            self.published_times.append(self.time_tag[0] or self.time_tag[1])
+            self.time_tag = None
         if tag == "a" and self.anchor is not None:
             self.links.append((self.anchor[0], tidy(self.anchor[1])))
             self.anchor = None
@@ -132,7 +182,21 @@ def article(page, url, anchor):
     date = next((d for key in META_DATES if (d := date_iso(meta.get(key, "")))), "")
     if title and date and (meta.get("og:type", "").lower() == "article" or NEWS.search(url)):
         return {"titolo": title, "url": url, "data_pubblicazione": date, "prova": "metadati di pubblicazione"}
+    if title and NEWS.search(urlsplit(url).path):
+        dates = {d for raw in page.published_times if (d := human_date(raw))}
+        # Only explicit publication labels; never infer from performance dates.
+        for line in page.visible_text:
+            m = re.fullmatch(r"(?:pubblicat[oa](?: il)?|publi[eé] le|published(?: on)?|veröffentlicht am|publicado el)\s*:?\s*(.+)", line, re.I)
+            if m and (d := human_date(m.group(1))):
+                dates.add(d)
+        if len(dates) == 1:
+            return {"titolo": title, "url": url, "data_pubblicazione": dates.pop(), "prova": "etichetta esplicita di pubblicazione"}
     return None
+
+def blocked(page):
+    title = (page.title or "").lower()
+    text = " ".join(page.visible_text[:30]).lower()
+    return any(x in title or x in text for x in ("just a moment", "checking your browser", "verify you are human", "access denied", "attention required", "checking your connection", "verifica di sicurezza"))
 
 def inspect(row, max_articles):
     site = row["sito_candidato"].strip()
@@ -146,6 +210,10 @@ def inspect(row, max_articles):
         result["stato"] = "Accesso fallito"
         return result
     home = parse(body)
+    if blocked(home):
+        result["errori"].append({"url": base, "errore": "Schermata di sicurezza; nessun tentativo di aggiramento"})
+        result["stato"] = "Accesso fallito"
+        return result
     sections = {}
     explicit = row.get("pagina_notizie", "").strip()
     if explicit:
@@ -166,6 +234,9 @@ def inspect(row, max_articles):
         if not same_site(final, base) or final.rstrip("/") == base.rstrip("/"):
             continue
         page = parse(body)
+        if blocked(page):
+            result["errori"].append({"url": final, "errore": "Schermata di sicurezza"})
+            continue
         result["sezioni"].append({"url": final, "etichetta": label, "titolo": page.title})
         for u, title in links(page, final):
             if u.rstrip("/") == final.rstrip("/") or len(title) < 18:
@@ -173,9 +244,6 @@ def inspect(row, max_articles):
             path = urlsplit(u).path
             if NEWS.search(path) or path.startswith(urlsplit(final).path.rstrip("/") + "/"):
                 candidates.setdefault(u, title)
-        a = article(page, final, label)
-        if a and a not in result["articoli"]:
-            result["articoli"].append(a)
     for url, title in list(candidates.items())[:max_articles]:
         final, body, err = get_page(url)
         if err:
@@ -183,7 +251,11 @@ def inspect(row, max_articles):
             continue
         if not same_site(final, base):
             continue
-        a = article(parse(body), final, title)
+        page = parse(body)
+        if blocked(page):
+            result["errori"].append({"url": final, "errore": "Schermata di sicurezza"})
+            continue
+        a = article(page, final, title)
         if a:
             if not any(x["url"] == a["url"] for x in result["articoli"]):
                 result["articoli"].append(a)
