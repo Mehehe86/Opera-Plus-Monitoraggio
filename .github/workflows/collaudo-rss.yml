@@ -3,12 +3,12 @@ on:
   workflow_dispatch:
     inputs:
       category:
-        description: Categoria esatta (vuoto = tutte)
-        default: 'Testata specializzata'
+        description: Categoria esatta oppure TUTTE
+        default: 'TUTTE'
         type: string
       limit:
         description: Numero di fonti (0 = tutte)
-        default: '5'
+        default: '0'
         type: string
       offset:
         description: Numero di fonti da saltare
@@ -35,7 +35,9 @@ jobs:
           CATEGORY: ${{ inputs.category }}
           LIMIT: ${{ inputs.limit }}
           OFFSET: ${{ inputs.offset }}
-        run: python scripts/censimento_rss.py --category "$CATEGORY" --limit "$LIMIT" --offset "$OFFSET" --workers 4
+        run: |
+          if [ "$CATEGORY" = "TUTTE" ]; then CATEGORY=""; fi
+          python scripts/censimento_rss.py --category "$CATEGORY" --limit "$LIMIT" --offset "$OFFSET" --workers 4
       - name: Salva rapporto
         uses: actions/upload-artifact@v4
         with:
