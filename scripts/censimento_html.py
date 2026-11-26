@@ -201,16 +201,23 @@ def listing_articles(page, base, source):
     """Only the two verified official listing layouts; no generic date inference."""
     found = {}
     if source == "Opéra national de Paris":
-        for url, label in links(page, base):
-            if not re.fullmatch(r"/actualites/[^/]+/?", urlsplit(url).path):
+        pending = ""
+        for kind, value in page.tokens:
+            if kind == "text":
+                pending = human_date(value)
                 continue
-            m = re.match(r"^(\d{1,2}(?:er)?\s+[^\W\d_]+\s+\d{4})\s+(.+)$", label, re.I)
-            if not m:
+            href, title = value
+            url = urldefrag(urljoin(base, href))[0]
+            if not same_site(url, base) or not re.fullmatch(r"/actualites/[^/]+/?", urlsplit(url).path) or urlsplit(url).path.rstrip("/") in ("/actualites/communiques", "/actualites/breves"):
+                pending = ""
                 continue
-            date = human_date(m.group(1))
-            title = tidy(m.group(2))
+            m = re.match(r"^(\d{1,2}(?:er)?\s+[^\W\d_]+\s+\d{4})\s+(.+)$", title, re.I)
+            date = human_date(m.group(1)) if m else pending
+            if m:
+                title = tidy(m.group(2))
             if date and len(title) >= 8:
-                found[url] = {"titolo": title, "url": url, "data_pubblicazione": date, "prova": "data e titolo nello stesso link della pagina ufficiale", "pagina_prova": base}
+                found[url] = {"titolo": title, "url": url, "data_pubblicazione": date, "prova": "data associata al titolo nella lista ufficiale dei comunicati", "pagina_prova": base}
+            pending = ""
     elif source == "Teatro Regio Torino":
         pending = None
         marked = False
