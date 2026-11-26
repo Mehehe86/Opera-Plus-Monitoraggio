@@ -197,10 +197,15 @@ def article(page, url, anchor):
             return {"titolo": title, "url": url, "data_pubblicazione": dates.pop(), "prova": "etichetta esplicita di pubblicazione"}
     return None
 
+@lru_cache(maxsize=1)
+def listing_config():
+    return json.loads((ROOT / "config" / "html.json").read_text(encoding="utf-8"))
+
 def listing_articles(page, base, source):
-    """Only the two verified official listing layouts; no generic date inference."""
+    """Configured listing layouts; no generic date inference."""
+    rule = listing_config().get(source, {})
     found = {}
-    if source == "Opéra national de Paris":
+    if rule.get("model") == "date_then_title":
         pending = ""
         for kind, value in page.tokens:
             if kind == "text":
@@ -208,7 +213,7 @@ def listing_articles(page, base, source):
                 continue
             href, title = value
             url = urldefrag(urljoin(base, href))[0]
-            if not same_site(url, base) or not re.fullmatch(r"/actualites/[^/]+/?", urlsplit(url).path) or urlsplit(url).path.rstrip("/") in ("/actualites/communiques", "/actualites/breves"):
+            if not same_site(url, base) or not re.fullmatch(rule["path_pattern"], urlsplit(url).path) or urlsplit(url).path.rstrip("/") in rule.get("exclude_paths", []):
                 pending = ""
                 continue
             m = re.match(r"^(\d{1,2}(?:er)?\s+[^\W\d_]+\s+\d{4})\s+(.+)$", title, re.I)
@@ -218,12 +223,12 @@ def listing_articles(page, base, source):
             if date and len(title) >= 8:
                 found[url] = {"titolo": title, "url": url, "data_pubblicazione": date, "prova": "data associata al titolo nella lista ufficiale dei comunicati", "pagina_prova": base}
             pending = ""
-    elif source == "Teatro Regio Torino":
+    elif rule.get("model") == "marked_title_then_date":
         pending = None
         marked = False
         for kind, value in page.tokens:
             if kind == "text":
-                if value.casefold() == "comunicato stampa":
+                if value.casefold() == rule["marker"].casefold():
                     marked, pending = True, None
                 elif pending:
                     date = human_date(value)
@@ -235,7 +240,7 @@ def listing_articles(page, base, source):
             elif kind == "link":
                 href, title = value
                 url = urldefrag(urljoin(base, href))[0]
-                if marked and same_site(url, base) and urlsplit(url).path.startswith("/area-stampa/comunicato-stampa/") and title.casefold() not in ("accedi ai contenuti", "scarica") and len(title) >= 8:
+                if marked and same_site(url, base) and re.fullmatch(rule["path_pattern"], urlsplit(url).path) and title.casefold() not in rule.get("exclude_titles", []) and len(title) >= 8:
                     pending = (url, title)
                     marked = False
                 else:
@@ -275,8 +280,10 @@ def inspect(row, max_articles):
     for path in ("news", "notizie", "comunicati-stampa", "it/news", "it/notizie", "en/news", "fr/actualites", "actualites", "press", "presse"):
         sections.setdefault(urljoin(base, "/" + path), "tentativo")
     candidates = {}
-    if row["fonte"] in ("Teatro Regio Torino", "Opéra national de Paris") and explicit:
-        sections = {urljoin(base, explicit): "pagina registrata"}
+    rule = listing_config().get(row["fonte"], {})
+    if rule and explicit:
+        primary = urljoin(base, explicit)
+        sections = {primary: "pagina registrata", **{u: label for u, label in sections.items() if u != primary}}
     for url, label in list(sections.items())[:12]:
         final, body, err = get_page(url)
         if err:
@@ -291,6 +298,8 @@ def inspect(row, max_articles):
         result["sezioni"].append({"url": final, "etichetta": label, "titolo": page.title})
         if label == "pagina registrata":
             result["articoli"].extend(listing_articles(page, final, row["fonte"]))
+        if rule and label == "pagina registrata" and len(result["articoli"]) >= rule.get("minimum_expected", 1):
+            break
         for u, title in links(page, final):
             if u.rstrip("/") == final.rstrip("/") or len(title) < 18:
                 continue
@@ -316,6 +325,7 @@ def inspect(row, max_articles):
                 result["articoli"].append(a)
         else:
             result["candidati_non_confermati"].append({"url": final, "titolo_link": title})
+    result["diagnostica"] = {"modello": rule.get("model", "generico"), "estrazione_riuscita": bool(result["articoli"]), "copertura_completa_verificata": False, "richiede_verifica_alternativa": not bool(result["articoli"])}
     result["stato"] = "Articoli con data confermata" if result["articoli"] else "Sezioni candidate senza articoli confermati" if result["sezioni"] else "Sezione non individuata"
     return result
 
