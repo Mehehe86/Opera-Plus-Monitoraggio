@@ -90,6 +90,7 @@ class Page(HTMLParser):
         self.published_times = []
         self.time_tag = None
         self.visible_text = []
+        self.tokens = []
         self.hidden = 0
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -114,6 +115,8 @@ class Page(HTMLParser):
     def handle_data(self, data):
         if not self.hidden:
             self.visible_text.append(tidy(data))
+            if tidy(data) and self.anchor is None:
+                self.tokens.append(("text", tidy(data)))
         if self.time_tag is not None:
             self.time_tag[1] += data
         if self.anchor is not None:
@@ -130,6 +133,7 @@ class Page(HTMLParser):
             self.time_tag = None
         if tag == "a" and self.anchor is not None:
             self.links.append((self.anchor[0], tidy(self.anchor[1])))
+            self.tokens.append(("link", (self.anchor[0], tidy(self.anchor[1]))))
             self.anchor = None
         if tag == "script" and self.script is not None:
             try:
@@ -193,10 +197,48 @@ def article(page, url, anchor):
             return {"titolo": title, "url": url, "data_pubblicazione": dates.pop(), "prova": "etichetta esplicita di pubblicazione"}
     return None
 
+def listing_articles(page, base, source):
+    """Only the two verified official listing layouts; no generic date inference."""
+    found = {}
+    if source == "Opéra national de Paris":
+        for url, label in links(page, base):
+            if not re.fullmatch(r"/actualites/[^/]+/?", urlsplit(url).path):
+                continue
+            m = re.match(r"^(\d{1,2}(?:er)?\s+[^\W\d_]+\s+\d{4})\s+(.+)$", label, re.I)
+            if not m:
+                continue
+            date = human_date(m.group(1))
+            title = tidy(m.group(2))
+            if date and len(title) >= 8:
+                found[url] = {"titolo": title, "url": url, "data_pubblicazione": date, "prova": "data e titolo nello stesso link della pagina ufficiale", "pagina_prova": base}
+    elif source == "Teatro Regio Torino":
+        pending = None
+        marked = False
+        for kind, value in page.tokens:
+            if kind == "text":
+                if value.casefold() == "comunicato stampa":
+                    marked, pending = True, None
+                elif pending:
+                    date = human_date(value)
+                    if date:
+                        url, title = pending
+                        found[url] = {"titolo": title, "url": url, "data_pubblicazione": date, "prova": "data dopo il titolo nel blocco comunicato stampa", "pagina_prova": base}
+                    # Only the immediately following nonempty text token.
+                    pending, marked = None, False
+            elif kind == "link":
+                href, title = value
+                url = urldefrag(urljoin(base, href))[0]
+                if marked and same_site(url, base) and urlsplit(url).path.startswith("/area-stampa/comunicato-stampa/") and title.casefold() not in ("accedi ai contenuti", "scarica") and len(title) >= 8:
+                    pending = (url, title)
+                    marked = False
+                else:
+                    pending = None
+    return list(found.values())
+
 def blocked(page):
     title = (page.title or "").lower()
     text = " ".join(page.visible_text[:30]).lower()
-    return any(x in title or x in text for x in ("just a moment", "checking your browser", "verify you are human", "access denied", "attention required", "checking your connection", "verifica di sicurezza"))
+    return any(x in title or x in text for x in ("just a moment", "checking your browser", "verify you are human", "access denied", "attention required", "checking your connection", "verifica di sicurezza", "security check required"))
 
 def inspect(row, max_articles):
     site = row["sito_candidato"].strip()
@@ -226,6 +268,8 @@ def inspect(row, max_articles):
     for path in ("news", "notizie", "comunicati-stampa", "it/news", "it/notizie", "en/news", "fr/actualites", "actualites", "press", "presse"):
         sections.setdefault(urljoin(base, "/" + path), "tentativo")
     candidates = {}
+    if row["fonte"] in ("Teatro Regio Torino", "Opéra national de Paris") and explicit:
+        sections = {urljoin(base, explicit): "pagina registrata"}
     for url, label in list(sections.items())[:12]:
         final, body, err = get_page(url)
         if err:
@@ -238,6 +282,8 @@ def inspect(row, max_articles):
             result["errori"].append({"url": final, "errore": "Schermata di sicurezza"})
             continue
         result["sezioni"].append({"url": final, "etichetta": label, "titolo": page.title})
+        if label == "pagina registrata":
+            result["articoli"].extend(listing_articles(page, final, row["fonte"]))
         for u, title in links(page, final):
             if u.rstrip("/") == final.rstrip("/") or len(title) < 18:
                 continue
@@ -245,6 +291,8 @@ def inspect(row, max_articles):
             if NEWS.search(path) or path.startswith(urlsplit(final).path.rstrip("/") + "/"):
                 candidates.setdefault(u, title)
     for url, title in list(candidates.items())[:max_articles]:
+        if any(a["url"] == url for a in result["articoli"]):
+            continue
         final, body, err = get_page(url)
         if err:
             result["errori"].append({"url": url, "errore": err})
@@ -266,6 +314,7 @@ def inspect(row, max_articles):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--source", action="append", default=[], help="Nome esatto della fonte; ripetibile")
     p.add_argument("--all", action="store_true", help="Tutte le fonti anziché il gruppo pilota")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--max-articles", type=int, default=15)
@@ -275,7 +324,11 @@ def main():
         p.error("Limiti non validi")
     with (ROOT / "fonti.csv").open(encoding="utf-8-sig", newline="") as f:
         rows = list(csv.DictReader(f))
-    if not args.all:
+    if args.source:
+        rows = [r for r in rows if r["fonte"] in args.source]
+        if len(rows) != len(set(args.source)):
+            raise ValueError("Fonte richiesta non trovata")
+    elif not args.all:
         rows = [r for r in rows if r["fonte"] in PILOT]
         if len(rows) != len(PILOT):
             raise ValueError("Gruppo pilota incompleto")
