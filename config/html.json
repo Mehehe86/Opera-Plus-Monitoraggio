@@ -1,0 +1,21 @@
+{
+  "Teatro Regio Torino": {
+    "model": "marked_title_then_date",
+    "path_pattern": "/area-stampa/comunicato-stampa/.+",
+    "marker": "comunicato stampa",
+    "exclude_titles": [
+      "accedi ai contenuti",
+      "scarica"
+    ],
+    "minimum_expected": 1
+  },
+  "Opéra national de Paris": {
+    "model": "date_then_title",
+    "path_pattern": "/actualites/[^/]+/?",
+    "exclude_paths": [
+      "/actualites/communiques",
+      "/actualites/breves"
+    ],
+    "minimum_expected": 1
+  }
+}
