@@ -1,0 +1,45 @@
+name: Collaudo RSS
+on:
+  workflow_dispatch:
+    inputs:
+      category:
+        description: Categoria esatta (vuoto = tutte)
+        default: 'Testata specializzata'
+        type: string
+      limit:
+        description: Numero di fonti (0 = tutte)
+        default: '5'
+        type: string
+      offset:
+        description: Numero di fonti da saltare
+        default: '0'
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: collaudo-rss
+  cancel-in-progress: false
+jobs:
+  censimento:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Controllo sintattico
+        run: python -m py_compile scripts/censimento_rss.py
+      - name: Censimento
+        env:
+          CATEGORY: ${{ inputs.category }}
+          LIMIT: ${{ inputs.limit }}
+          OFFSET: ${{ inputs.offset }}
+        run: python scripts/censimento_rss.py --category "$CATEGORY" --limit "$LIMIT" --offset "$OFFSET" --workers 4
+      - name: Salva rapporto
+        uses: actions/upload-artifact@v4
+        with:
+          name: censimento-rss
+          path: rapporti/censimento.json
+          if-no-files-found: error
+          retention-days: 14
