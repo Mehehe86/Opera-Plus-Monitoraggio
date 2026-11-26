@@ -1,0 +1,28 @@
+name: Collaudo HTML
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: collaudo-html
+  cancel-in-progress: false
+jobs:
+  censimento:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Controllo sintattico
+        run: python -m py_compile scripts/censimento_rss.py scripts/censimento_html.py
+      - name: Collaudo cinque teatri
+        run: python scripts/censimento_html.py --max-articles 15
+      - name: Salva rapporto
+        uses: actions/upload-artifact@v4
+        with:
+          name: censimento-html
+          path: rapporti/censimento_html.json
+          if-no-files-found: error
+          retention-days: 14
